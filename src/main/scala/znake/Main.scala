@@ -2,6 +2,7 @@ package znake
 
 import java.io.IOException
 
+import jline.console.ConsoleReader
 import jline.internal.NonBlockingInputStream
 import scalaz.zio._
 import scalaz.zio.console._
@@ -22,31 +23,32 @@ object KeyListeners {
     case object Left extends Keys
   }
 
-  val streamIO: IO[Exception, NonBlockingInputStream] =
-    IO.syncException {
-      val con = new jline.console.ConsoleReader
-      val is = con.getInput
-      new jline.internal.NonBlockingInputStream(is, true)
-    }
+  val consoleReaderIO: IO[Exception, ConsoleReader] =
+    IO.syncException(new ConsoleReader)
 
-  def updateKeys(stream: NonBlockingInputStream, ref: Ref[Keys]): IO[Exception, Unit] =
+  def inputStreamIO(reader: ConsoleReader): IO[Exception, NonBlockingInputStream] =
+    IO.syncException(new NonBlockingInputStream(reader.getInput, true))
+
+  val streamIO: IO[Exception, NonBlockingInputStream] =
+  consoleReaderIO.flatMap(inputStreamIO)
+
+  def updateKeys(stream: NonBlockingInputStream, onKey: Keys => IO[Nothing, Unit]): IO[Exception, Unit] =
     for {
       nbis <- IO.now(stream)
       r    <- IO.now(nbis.read(10))
-      curr <- ref.get
-      key  = r.toChar match {
-        case 'A' => Keys.Up
-        case 'B' => Keys.Down
-        case 'C' => Keys.Right
-        case 'D' => Keys.Left
-        case _   => curr
+      _    <- r.toChar match {
+        case 'A' => onKey(Keys.Up)
+        case 'B' => onKey(Keys.Down)
+        case 'C' => onKey(Keys.Right)
+        case 'D' => onKey(Keys.Left)
+        case _   => IO.unit
       }
-      _    <- ref.set(key)
     } yield ()
 
-  def listen(ref: Ref[Keys]): IO[Exception, Nothing] =
-    streamIO.flatMap(updateKeys(_, ref).forever)
+  def listen(onKey: Keys => IO[Nothing, Unit]): IO[Exception, Unit] =
+    streamIO.flatMap(r => updateKeys(r, onKey).repeat(Schedule.spaced(25 millis)).void)
 }
+
 
 object Main extends App {
 
@@ -56,12 +58,12 @@ object Main extends App {
   private val startSnake: Snake = List(Loc(5, 5), Loc(4, 5), Loc(3, 5))
   private val startInput: Keys = Right
 
-  case class Loc(x: Int, y: Int) {
-    def incrementX = Loc(x + 1, y)
-  }
+  case class Loc(x: Int, y: Int)
 
-  case class State(name: String, snake: Snake, points: Int, apple: Loc) {
+  case class State(name: String, snake: Snake, points: Int, justFed: Boolean, apple: Loc) {
     def moveSnake(dir: Keys): State = {
+      val tail = if (justFed) snake else snake.init
+
       val updated = snake match {
         case x :: _ =>
           (dir match {
@@ -69,11 +71,11 @@ object Main extends App {
             case Right => x.copy(x = x.x + 1)
             case Up    => x.copy(y = x.y - 1)
             case Down  => x.copy(y = x.y + 1)
-          }) :: snake.init
+          }) :: tail
         case x => x
       }
 
-      State(name, updated, points, apple)
+      State(name, updated, points, false, apple)
     }
 
     val hasEatenSelf: Boolean = snake match {
@@ -114,6 +116,17 @@ object Main extends App {
       else IO.now(loc)
     } yield loc
 
+  def onKey(ref: Ref[Keys]): Keys => IO[Nothing, Unit] =
+    nextKey =>
+      for {
+        curr <- ref.get
+        _    <- (nextKey, curr) match {
+          case (Keys.Up | Keys.Down, Keys.Up | Keys.Down) |
+               (Keys.Left | Keys.Right, Keys.Left | Keys.Right) => IO.unit
+          case _ => ref.set(nextKey)
+        }
+      } yield ()
+
   val znakeGame: IO[IOException, Unit] =
     for {
       _     <- putStrLn("Welcome to Znake!")
@@ -121,10 +134,10 @@ object Main extends App {
       _     <- welcomeMsg
       snake  = startSnake
       apple <- appleLoc(snake)
-      state  = State(name, snake, 0, apple)
+      state  = State(name, snake, 0, false, apple)
       _     <- renderGame(state)
       input <- Ref(startInput)
-      _     <- KeyListeners.listen(input).fork
+      _     <- KeyListeners.listen(onKey(input)).supervised.fork
       _     <- gameLoop(state, input)
     } yield ()
 
@@ -142,7 +155,7 @@ object Main extends App {
     for {
       dir   <- input.get
       state <- IO.now(state.moveSnake(dir))
-      _     <- if (state.hasEatenApple) eatApple(state)
+      state <- if (state.hasEatenApple) eatApple(state)
                else IO.now(state)
     } yield state
 
@@ -150,16 +163,20 @@ object Main extends App {
     for {
       apple <- appleLoc(state.snake)
       points = state.points + 1
-      state <- IO.now(state.copy(points = points, apple = apple))
+      state <- IO.now(state.copy(points = points, justFed = true, apple = apple))
     } yield state
 
   def renderGame(state: State): IO[IOException, Unit] = {
+    // Kurt   10
     // |-------|
     // |  @    |
     // |    x  |
     // |   xx  |
     // |-------|
 
+    val screenSize = boardSize + 2
+    val spaces = (screenSize - (state.name.length + state.points.toString.length)).max(2)
+    val points = state.name + (" " * spaces) + state.points
     val border = s"|${(1 to boardSize).map(_ => "-").mkString}|"
     val board = for {
       y   <- 0 until boardSize
@@ -176,6 +193,7 @@ object Main extends App {
 
     for {
       _ <- putStrLn("\033\143")
+      _ <- putStrLn(points)
       _ <- putStrLn(border)
       _ <- board.foldLeft[IO[IOException, Unit]](
                  IO.now(()))(
